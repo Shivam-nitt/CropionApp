@@ -8,6 +8,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import paho.mqtt.client as mqtt
 from datetime import datetime, timezone
+from dateutil import parser as dtparser 
+import csv
+from statistics import mean, median
 
 # -------- CONFIG --------
 MQTT_BROKER = "localhost"
@@ -44,6 +47,30 @@ def init_db(path: str):
     )
     """)
     conn.commit()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS latency_telemetry (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT,
+        publish_ts TEXT,
+        receive_ts TEXT,
+        latency_ms REAL
+    )
+    """)
+    conn.commit()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS frames_received (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT,
+        frame_id INTEGER,
+        publish_ts TEXT,
+        receive_ts TEXT,
+        latency_ms REAL
+    )
+    """)
+    conn.commit()
+
     conn.close()
 
 # Insert a single flattened row (short-lived connection to be thread safe)
@@ -56,71 +83,153 @@ def insert_row(path: str, timestamp, battery, lat, lon, temperature):
     """, (timestamp, battery, lat, lon, temperature))
     conn.commit()
     conn.close()
+    
+def insert_latency_telemetry(path, device_id, publish_ts, receive_ts, latency_ms):
+    conn = sqlite3.connect(path, timeout=SQLITE_TIMEOUT)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO latency_telemetry (device_id, publish_ts, receive_ts, latency_ms) VALUES (?, ?, ?, ?)",
+        (device_id, publish_ts, receive_ts, latency_ms)
+    )
+    conn.commit()
+    conn.close()
+
+def insert_frame_received(path, device_id, frame_id, publish_ts, receive_ts, latency_ms):
+    """
+    Insert one frames_received row.
+    Note: the frames_received table columns are:
+      id (AUTOINCREMENT), device_id, frame_id, publish_ts, receive_ts, latency_ms
+    So the SQL must insert exactly 5 values (excluding id).
+    """
+    conn = sqlite3.connect(path, timeout=SQLITE_TIMEOUT)
+    cur = conn.cursor()
+
+    # DEBUG: print the tuple we are about to insert (helps confirm shape)
+    values = (device_id, frame_id, publish_ts, receive_ts, latency_ms)
+    try:
+        # Print debug only to server console so you can see what's being inserted
+        print("[DEBUG] insert_frame_received values tuple length:", len(values), "values:", values)
+    except Exception:
+        pass
+
+    cur.execute(
+        "INSERT INTO frames_received (device_id, frame_id, publish_ts, receive_ts, latency_ms) VALUES (?, ?, ?, ?, ?)",
+        values
+    )
+    conn.commit()
+    conn.close()
+
+
 
 # MQTT callbacks
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("[MQTT] Connected to broker.")
         client.subscribe(MQTT_TOPIC)
+        client.subscribe("device/frame",qos=1)
         print(f"[MQTT] Subscribed to {MQTT_TOPIC}")
+        print(f"[MQTT] Subscribed to device/frame")
     else:
         print("[MQTT] Failed to connect, rc=", rc)
 
 def on_message(client, userdata, msg):
+    """
+    MQTT message handler for:
+      - topic "device/telemetry"  : telemetry JSON (device_id, timestamp, battery, lat, lon, temperature)
+      - topic "device/frame"      : frame notifications (device_id, frame_id, timestamp)
+
+    Records:
+      - telemetry rows via insert_row(DB_PATH, parsed)
+      - latency in latency_telemetry (publish_ts -> receive_ts)
+      - frame receives in frames_received (and their latency)
+      - updates in-memory latest reading (_latest_reading) for telemetry
+    """
     global _latest_reading
-    payload_text = None
+
+    topic = msg.topic
+    payload_text = msg.payload.decode("utf-8")
+
+    # parse JSON payload safely
     try:
-        payload_text = msg.payload.decode("utf-8")
         parsed = json.loads(payload_text)
     except Exception as e:
-        print("[MQTT] Failed to decode/parse payload:", e, "raw:", payload_text)
+        print("[MQTT] Failed to parse JSON payload on topic", topic, "error:", e)
         return
 
-    # Extract fields
-    # Accept either "temperature" or "temp"
-    battery = parsed.get("battery")
-    temperature = parsed.get("temperature", parsed.get("temp"))
-    # GPS: either lat/lon or gps: [lat, lon]
-    lat = parsed.get("lat")
-    lon = parsed.get("lon")
-    if (lat is None or lon is None) and isinstance(parsed.get("gps"), (list, tuple)):
-        gps = parsed.get("gps")
-        if len(gps) >= 2:
-            lat, lon = gps[0], gps[1]
-    # timestamp: prefer publisher timestamp, else receiver time
-    timestamp = parsed.get("timestamp")
-    if not timestamp:
-        timestamp = datetime.now(timezone.utc).isoformat()
+    # receive timestamp recorded by backend (ISO UTC)
+    receive_ts = datetime.now(timezone.utc).isoformat()
 
-    # Try to coerce numeric values, fall back to None
-    def to_float(v):
+    # --- Telemetry messages ---
+    if topic == "device/telemetry":
+        # 1) store telemetry row (existing function)
         try:
-            return float(v) if v is not None else None
-        except Exception:
-            return None
+            insert_row(
+                DB_PATH,
+                parsed.get("timestamp"),
+                parsed.get("battery"),
+                parsed.get("lat"),
+                parsed.get("lon"),
+                parsed.get("temperature")
+            )
 
-    battery = to_float(battery)
-    temperature = to_float(temperature)
-    lat = to_float(lat)
-    lon = to_float(lon)
+        except Exception as e:
+            print("[MQTT] Failed insert_row:", e)
 
-    # Insert into DB (short-lived connection)
-    try:
-        insert_row(DB_PATH, timestamp, battery, lat, lon, temperature)
-    except Exception as e:
-        print("[DB] insert failed:", e)
+        # 2) compute latency if publisher provided timestamp
+        pub_ts = parsed.get("timestamp")
+        lat_ms = None
+        if pub_ts:
+            try:
+                p = dtparser.isoparse(pub_ts)
+                r = dtparser.isoparse(receive_ts)
+                lat_ms = (r - p).total_seconds() * 1000.0
+            except Exception:
+                lat_ms = None
 
-    # Update in-memory latest reading (atomic)
-    with _latest_lock:
-        _latest_reading = {
-            "timestamp": timestamp,
-            "battery": battery,
-            "lat": lat,
-            "lon": lon,
-            "temperature": temperature
-        }
+        # 3) insert latency record
+        try:
+            insert_latency_telemetry(DB_PATH, parsed.get("device_id"), pub_ts, receive_ts, lat_ms)
+        except Exception as e:
+            print("[MQTT] Failed insert_latency_telemetry:", e)
 
-    print("[MQTT] Received and stored:", _latest_reading)
+        # 4) update in-memory latest reading safely
+        try:
+            with _latest_lock:
+                _latest_reading = {
+                    "timestamp": parsed.get("timestamp"),
+                    "device_id": parsed.get("device_id"),
+                    "battery": parsed.get("battery"),
+                    "lat": parsed.get("lat"),
+                    "lon": parsed.get("lon"),
+                    "temperature": parsed.get("temperature")
+                }
+        except Exception as e:
+            print("[MQTT] Failed update _latest_reading:", e)
+        return
+
+    # --- Frame messages ---
+    if topic == "device/frame":
+        pub_ts = parsed.get("timestamp")
+        frame_id = parsed.get("frame_id")
+        lat_ms = None
+        if pub_ts:
+            try:
+                p = dtparser.isoparse(pub_ts)
+                r = dtparser.isoparse(receive_ts)
+                lat_ms = (r - p).total_seconds() * 1000.0
+            except Exception:
+                lat_ms = None
+
+        try:
+            insert_frame_received(DB_PATH, parsed.get("device_id"), frame_id, pub_ts, receive_ts, lat_ms)
+        except Exception as e:
+            print("[MQTT] Failed insert_frame_received:", e)
+        return
+
+    # Unhandled topics: silently ignore or log
+    # print("[MQTT] Unhandled topic:", topic)
+
+
 
 # Start MQTT client in background (non-blocking)
 def start_mqtt_background():
@@ -186,3 +295,74 @@ def get_latest():
         print("[GET] DB fetch failed:", e)
 
     raise HTTPException(status_code=404, detail="No telemetry available yet.")
+
+from typing import List, Optional
+from pydantic import BaseModel
+
+# Response model for a telemetry row
+class TelemetryRow(BaseModel):
+    id: int
+    timestamp: Optional[str]
+    device_id: Optional[str]
+    battery: Optional[float]
+    lat: Optional[float]
+    lon: Optional[float]
+    temperature: Optional[float]
+
+# New endpoint: /telemetry/history?last=60
+@app.get("/telemetry/history")
+def telemetry_history(last: int = 60, device_id: str | None = None):
+    MAX_ROWS = 10000
+
+    # validate 'last'
+    if last <= 0:
+        raise HTTPException(status_code=400, detail="`last` must be > 0")
+    if last > MAX_ROWS:
+        last = MAX_ROWS
+
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cur = conn.cursor()
+
+        # if filtering by device_id
+        if device_id:
+            cur.execute("""
+                SELECT id, timestamp, device_id, battery, lat, lon, temperature
+                FROM telemetry
+                WHERE device_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+            """, (device_id, last))
+        else:
+            cur.execute("""
+                SELECT id, timestamp, device_id, battery, lat, lon, temperature
+                FROM telemetry
+                ORDER BY id DESC
+                LIMIT ?
+            """, (last,))
+
+        rows = cur.fetchall()
+        conn.close()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Database read error: {e}")
+
+    # convert to dicts
+    result = [
+        {
+            "id": r[0],
+            "timestamp": r[1],
+            "device_id": r[2],
+            "battery": r[3],
+            "lat": r[4],
+            "lon": r[5],
+            "temperature": r[6]
+        }
+        for r in rows
+    ]
+
+    # return chronological order (oldest → newest)
+    return result[::-1]
+

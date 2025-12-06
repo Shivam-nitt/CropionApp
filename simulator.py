@@ -15,7 +15,7 @@ MQTT_TOPIC = "device/telemetry"
 DB_PATH = "telemetry.db"               # stored in current folder
 CSV_PATH = "telemetry_log.csv"         # stored in current folder
 SEND_INTERVAL_SEC = 1                  # 1 Hz
-TOTAL_MESSAGES = 80                    # change to 60-100 as you want
+TOTAL_MESSAGES = 60                    # change to 60-100 as you want
 KEEP_LAST_N = 100                      # keep last 100 rows in sqlite
 DEVICE_ID = "sim-001"
 # -------------------------------
