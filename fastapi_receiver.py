@@ -366,3 +366,4 @@ def telemetry_history(last: int = 60, device_id: str | None = None):
     # return chronological order (oldest → newest)
     return result[::-1]
 
+
