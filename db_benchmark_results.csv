@@ -1,4 +1,0 @@
-db,total_seconds,avg_seconds_per_write
-sqlite,0.013822,1.3822e-05
-duckdb,4.910209,0.004910209
-lmdb,0.015504,1.5504e-05
