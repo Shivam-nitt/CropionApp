@@ -1,0 +1,4 @@
+db,total_seconds,avg_seconds_per_write
+sqlite,0.013635,1.3635e-05
+duckdb,1.578654,0.001578654
+lmdb,0.015165,1.5165e-05
