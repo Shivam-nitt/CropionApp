@@ -3,6 +3,7 @@ import json
 import sqlite3
 import threading
 import os
+from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -12,12 +13,17 @@ from dateutil import parser as dtparser
 import csv
 from statistics import mean, median
 from backend.anomaly_detection import AnomalyDetector 
+from backend.drone_registry import router as drone_router
+
 # -------- CONFIG --------
 MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
 MQTT_TOPIC = "device/telemetry"   # must match simulator topic
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "telemetry.db")   # reuse the DB you already have
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SAMPLES_DIR = ROOT_DIR / "samples"
+
 SQLITE_TIMEOUT = 10
 # ------------------------
 
@@ -30,6 +36,7 @@ class TelemetryIn(BaseModel):
 
 
 app = FastAPI(title="Telemetry Receiver")
+app.include_router(drone_router)
 
 # In-memory latest reading with lock for thread-safety
 _latest_lock = threading.Lock()
@@ -425,3 +432,27 @@ def get_alerts(limit: int = 50):
     except Exception as e:
         print("[GET /alerts] error:", e)
         raise HTTPException(status_code=500, detail="Could not fetch alerts")
+
+
+@app.get("/replay/sample")
+def replay_sample():
+    """
+    Returns sample telemetry sequence for frontend replay/demo.
+    Data loaded from samples/replay_telemetry.json.
+    """
+    path = SAMPLES_DIR / "replay_telemetry.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="replay_telemetry.json not found")
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print("[/replay/sample] Error reading sample file:", e)
+        raise HTTPException(status_code=500, detail="Failed to read replay sample")
+
+    # ensure it's a list of objects
+    if not isinstance(data, list):
+        raise HTTPException(status_code=500, detail="replay_telemetry.json must contain a JSON array")
+
+    return data
